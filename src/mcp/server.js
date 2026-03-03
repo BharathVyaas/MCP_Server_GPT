@@ -1,4 +1,4 @@
-import * as z from 'zod/v4';
+import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 
 const TENANT_ID = (process.env.AZURE_TENANT_ID || '').trim();

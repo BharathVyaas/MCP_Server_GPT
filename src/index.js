@@ -383,14 +383,17 @@ app.use('/mcp', (req, res, next) => {
 
 mountMcp(app);
 
-app.listen(PORT, (err) => {
-    if (err) {
-        console.error('Failed to start server:', err);
-        process.exit(1);
-    }
+const server = app.listen(PORT, () => {
     console.log(`HTTP listening on port ${PORT}`);
     console.log(`MCP   -> /mcp`);
     if (extraAllowedHosts.length > 0) {
         console.log(`MCP allowed hosts: ${mcpAppOptions.allowedHosts.join(', ')}`);
     }
+});
+
+// Fix #3: express's listen callback doesn't receive an error argument.
+// Attach an error event handler to properly catch port conflicts / startup failures.
+server.on('error', (err) => {
+    console.error('Failed to start server:', err);
+    process.exit(1);
 });
