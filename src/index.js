@@ -215,7 +215,7 @@ app.get('/health', (_req, res) => {
 });
 
 // Protected Resource Metadata (MCP requirement)
-app.get('/.well-known/oauth-protected-resource', (req, res) => {
+app.get(['/.well-known/oauth-protected-resource', '/mcp/.well-known/oauth-protected-resource'], (req, res) => {
     res.json(buildProtectedResourceMetadata(req));
 });
 
@@ -230,12 +230,12 @@ app.get('/.well-known/oauth-protected-resource/mcp', (req, res) => {
 });
 
 // Authorization Server Metadata (RFC8414-style)
-app.get('/.well-known/oauth-authorization-server', (req, res) => {
+app.get(['/.well-known/oauth-authorization-server', '/mcp/.well-known/oauth-authorization-server'], (req, res) => {
     res.json(buildAuthorizationServerMetadata(req));
 });
 
 // OIDC discovery (some clients prefer this endpoint)
-app.get('/.well-known/openid-configuration', (req, res) => {
+app.get(['/.well-known/openid-configuration', '/mcp/.well-known/openid-configuration'], (req, res) => {
     res.json(buildAuthorizationServerMetadata(req));
 });
 
