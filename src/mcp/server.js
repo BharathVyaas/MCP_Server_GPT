@@ -18,6 +18,12 @@ const DATAVERSE_SCOPE = (
 ).trim();
 const DATAVERSE_DEBUG = (process.env.DATAVERSE_DEBUG || '0') === '1';
 
+const BAP_URL = (process.env.BAP_URL || 'https://api.bap.microsoft.com').trim().replace(/\/+$/, '');
+const BAP_SCOPE = (process.env.BAP_SCOPE || `${BAP_URL}/user_impersonation`).trim();
+
+const FLOW_URL = (process.env.FLOW_URL || 'https://api.flow.microsoft.com').trim().replace(/\/+$/, '');
+const FLOW_SCOPE = (process.env.FLOW_SCOPE || `${FLOW_URL}/user_impersonation`).trim();
+
 const OBO_TOKEN_ENDPOINT = TENANT_ID
   ? `https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/token`
   : '';
@@ -37,13 +43,20 @@ const toErrorResponse = (message) => ({
 
 const ensureDataverseConfig = () => {
   const missing = [];
-  if (!TENANT_ID) missing.push('AZURE_TENANT_ID');
-  if (!MCP_SERVICE_APP_ID) missing.push('MCP_SERVICE_APP_ID');
-  if (!MCP_SERVICE_APP_CLIENT_SECRET) missing.push('MCP_SERVICE_APP_CLIENT_SECRET');
   if (!DATAVERSE_URL) missing.push('DATAVERSE_URL');
   if (!DATAVERSE_SCOPE) missing.push('DATAVERSE_SCOPE');
   if (missing.length > 0) {
-    throw new Error(`Missing required environment variables: ${missing.join(', ')}`);
+    throw new Error(`Missing required Dataverse environment variables: ${missing.join(', ')}`);
+  }
+};
+
+const ensureOAuthConfig = () => {
+  const missing = [];
+  if (!TENANT_ID) missing.push('AZURE_TENANT_ID');
+  if (!MCP_SERVICE_APP_ID) missing.push('MCP_SERVICE_APP_ID');
+  if (!MCP_SERVICE_APP_CLIENT_SECRET) missing.push('MCP_SERVICE_APP_CLIENT_SECRET');
+  if (missing.length > 0) {
+    throw new Error(`Missing required OAuth environment variables: ${missing.join(', ')}`);
   }
 };
 
@@ -98,8 +111,8 @@ const toSchemaName = (logicalName) => {
   return tail ? `${prefix}_${tail}` : prefix;
 };
 
-async function exchangeTokenOnBehalfOf(inboundAccessToken) {
-  ensureDataverseConfig();
+async function exchangeTokenOnBehalfOf(inboundAccessToken, targetScope = DATAVERSE_SCOPE) {
+  ensureOAuthConfig();
   if (!inboundAccessToken) {
     throw new Error('Missing incoming Bearer token. ChatGPT must call /mcp with Authorization: Bearer <token>.');
   }
@@ -110,7 +123,7 @@ async function exchangeTokenOnBehalfOf(inboundAccessToken) {
     grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
     requested_token_use: 'on_behalf_of',
     assertion: inboundAccessToken,
-    scope: DATAVERSE_SCOPE,
+    scope: targetScope,
   });
 
   const response = await fetch(OBO_TOKEN_ENDPOINT, {
@@ -125,20 +138,20 @@ async function exchangeTokenOnBehalfOf(inboundAccessToken) {
   const text = await response.text();
   const payload = parseMaybeJson(text);
   if (!response.ok || !payload?.access_token) {
-    throw new Error(`Dataverse OBO token exchange failed (${response.status}): ${toErrorText(response.status, payload)}`);
+    throw new Error(`OBO token exchange failed (${response.status}) for scope ${targetScope}: ${toErrorText(response.status, payload)}`);
   }
 
   return payload.access_token;
 }
 
-async function getClientCredentialsToken() {
-  ensureDataverseConfig();
+async function getClientCredentialsToken(targetScope = DATAVERSE_URL ? `${DATAVERSE_URL}/.default` : '') {
+  ensureOAuthConfig();
 
   const params = new URLSearchParams({
     client_id: MCP_SERVICE_APP_ID,
     client_secret: MCP_SERVICE_APP_CLIENT_SECRET,
     grant_type: 'client_credentials',
-    scope: DATAVERSE_URL ? `${DATAVERSE_URL}/.default` : '',
+    scope: targetScope,
   });
 
   const response = await fetch(OBO_TOKEN_ENDPOINT, {
@@ -153,7 +166,7 @@ async function getClientCredentialsToken() {
   const text = await response.text();
   const payload = parseMaybeJson(text);
   if (!response.ok || !payload?.access_token) {
-    throw new Error(`Dataverse client_credentials token exchange failed (${response.status}): ${toErrorText(response.status, payload)}`);
+    throw new Error(`Client credentials token exchange failed (${response.status}) for scope ${targetScope}: ${toErrorText(response.status, payload)}`);
   }
 
   return payload.access_token;
@@ -207,20 +220,69 @@ async function callDataverse(accessToken, { method = 'GET', path, query, headers
   };
 }
 
-const runWithDataverseToken = async (getInboundAccessToken, authMode, fn) => {
+async function callPowerPlatform(accessToken, baseUrl, { method = 'GET', path, query, headers, body }) {
+  ensureOAuthConfig();
+
+  const normalizedPath = String(path || '').replace(/^\/+/, '');
+  const url = new URL(normalizedPath, `${baseUrl}/`);
+  if (query) {
+    for (const [key, value] of Object.entries(query)) {
+      if (value === undefined || value === null || value === '') continue;
+      url.searchParams.set(key, String(value));
+    }
+  }
+
+  const requestHeaders = {
+    'Authorization': `Bearer ${accessToken}`,
+    'Accept': 'application/json',
+    ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+    ...(headers || {}),
+  };
+
+  const response = await fetch(url.toString(), {
+    method,
+    headers: requestHeaders,
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  });
+
+  const text = await response.text();
+  const payload = parseMaybeJson(text);
+  if (!response.ok) {
+    throw new Error(`API failed (${response.status}): ${toErrorText(response.status, payload)}`);
+  }
+
+  return {
+    status: response.status,
+    data: payload,
+  };
+}
+
+const runWithToken = async (getInboundAccessToken, authMode, targetScope, fn) => {
   try {
-    let dataverseAccessToken;
+    let accessToken;
     if (authMode === 'client_credentials') {
-      dataverseAccessToken = await getClientCredentialsToken();
+      accessToken = await getClientCredentialsToken(targetScope === DATAVERSE_SCOPE ? (DATAVERSE_URL ? `${DATAVERSE_URL}/.default` : '') : targetScope);
     } else {
       const inboundAccessToken = await Promise.resolve(getInboundAccessToken?.());
-      dataverseAccessToken = await exchangeTokenOnBehalfOf(inboundAccessToken);
+      accessToken = await exchangeTokenOnBehalfOf(inboundAccessToken, targetScope);
     }
-    const output = await fn(dataverseAccessToken);
+    const output = await fn(accessToken);
     return toJsonResponse(output);
   } catch (err) {
-    return toErrorResponse(err?.message || 'Unexpected Dataverse error');
+    return toErrorResponse(err?.message || 'Unexpected API error');
   }
+};
+
+const runWithDataverseToken = async (getInboundAccessToken, authMode, fn) => {
+  return runWithToken(getInboundAccessToken, authMode, DATAVERSE_SCOPE, fn);
+};
+
+const runWithBapToken = async (getInboundAccessToken, authMode, fn) => {
+  return runWithToken(getInboundAccessToken, authMode, BAP_SCOPE, fn);
+};
+
+const runWithFlowToken = async (getInboundAccessToken, authMode, fn) => {
+  return runWithToken(getInboundAccessToken, authMode, FLOW_SCOPE, fn);
 };
 
 export function buildMcpServer({ getInboundAccessToken, authMode = 'obo' } = {}) {
@@ -881,6 +943,59 @@ export function buildMcpServer({ getInboundAccessToken, authMode = 'obo' } = {})
           componentsAdded: addComponentsOk,
           published: true
         };
+      })
+  );
+
+  server.registerTool(
+    'powerplatform_list_environments',
+    {
+      title: 'List Power Platform Environments',
+      description: 'Fetch all visible Power Platform environments for the authenticated user/service principal.',
+      inputSchema: {},
+    },
+    async () =>
+      runWithBapToken(getInboundAccessToken, authMode, async (token) => {
+        return callPowerPlatform(token, BAP_URL, {
+          method: 'GET',
+          path: '/providers/Microsoft.BusinessAppPlatform/environments',
+          query: { 'api-version': '2023-06-01' }
+        });
+      })
+  );
+
+  server.registerTool(
+    'powerapps_management_api',
+    {
+      title: 'Power Apps Management API',
+      description: 'Make a raw REST call to the Power Apps Management API (api.bap.microsoft.com). Use this for environment definitions, tenant isolation, etc.',
+      inputSchema: {
+        method: z.enum(['GET', 'POST', 'PUT', 'PATCH', 'DELETE']).optional().default('GET'),
+        path: z.string().describe('Path, e.g. /providers/Microsoft.BusinessAppPlatform/environments'),
+        query: z.record(z.string(), z.unknown()).optional().describe('Query parameters, e.g. {"api-version": "2023-06-01"}'),
+        body: z.record(z.string(), z.unknown()).optional().describe('JSON body (for POST/PUT/PATCH)')
+      },
+    },
+    async ({ method = 'GET', path, query, body }) =>
+      runWithBapToken(getInboundAccessToken, authMode, async (token) => {
+        return callPowerPlatform(token, BAP_URL, { method, path, query, body });
+      })
+  );
+
+  server.registerTool(
+    'powerautomate_management_api',
+    {
+      title: 'Power Automate Management API',
+      description: 'Make a raw REST call to the Power Automate Management API (api.flow.microsoft.com). Use this to list, turn on, or find flows.',
+      inputSchema: {
+        method: z.enum(['GET', 'POST', 'PUT', 'PATCH', 'DELETE']).optional().default('GET'),
+        path: z.string().describe('Path, e.g. /providers/Microsoft.ProcessSimple/environments/{envName}/flows'),
+        query: z.record(z.string(), z.unknown()).optional().describe('Query parameters, e.g. {"api-version": "2016-11-01"}'),
+        body: z.record(z.string(), z.unknown()).optional().describe('JSON body (for POST/PUT/PATCH)')
+      },
+    },
+    async ({ method = 'GET', path, query, body }) =>
+      runWithFlowToken(getInboundAccessToken, authMode, async (token) => {
+        return callPowerPlatform(token, FLOW_URL, { method, path, query, body });
       })
   );
 
